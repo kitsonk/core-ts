@@ -40,6 +40,9 @@ function xhr(url, options) {
             response.data = request.response;
         }
 
+        response.statusCode = request.status;
+        response.statusText = request.statusText;
+
         deferred.resolve(response);
     };
 

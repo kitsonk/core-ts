@@ -17,8 +17,8 @@ var request = function (url, options) {
 
     var promise = request.providerRegistry.match(arguments).apply(null, arguments).then(function (response) {
         args.unshift(response);
-        return Promise.resolve(request.filterRegistry.match(args).apply(null, args)).then(function (data) {
-            response.data = data;
+        return Promise.resolve(request.filterRegistry.match(args).apply(null, args)).then(function (filterResponse) {
+            response.data = filterResponse.data;
             return response;
         });
     });
@@ -31,8 +31,8 @@ var request = function (url, options) {
 };
 
 request.providerRegistry = new Registry(defaultProvider);
-request.filterRegistry = new Registry(function (value) {
-    return value;
+request.filterRegistry = new Registry(function (response) {
+    return response;
 });
 
 // TODO: Put somewhere permanent

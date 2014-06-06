@@ -92,6 +92,7 @@ function node(url, options) {
 
         deferred.progress({ type: 'nativeResponse', response: nativeResponse });
         response.nativeResponse = nativeResponse;
+        response.statusCode = nativeResponse.statusCode;
     });
 
     request.once('error', deferred.reject);

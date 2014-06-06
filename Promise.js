@@ -144,6 +144,7 @@ var Promise = (function () {
     Promise.all = function (iterable) {
         function fulfill(key, value) {
             values[key] = value;
+            ++complete;
             finish();
         }
 
