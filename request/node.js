@@ -112,7 +112,7 @@ function node(url, options) {
             var timer = setTimeout(function () {
                 var error = new Error('Request timed out after ' + options.timeout + 'ms');
                 error.name = 'RequestTimeoutError';
-                promise.abort(error);
+                promise.cancel(error);
             }, options.timeout);
 
             return {
