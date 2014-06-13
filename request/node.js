@@ -76,7 +76,7 @@ function node(url, options) {
 
         nativeResponse.on('data', function (chunk) {
             options.streamData || data.push(chunk);
-            loaded += Buffer.byteLength(chunk);
+            loaded += Buffer.byteLength(chunk.toString(options.streamEncoding || 'utf8'));
             deferred.progress({ type: 'data', chunk: chunk, loaded: loaded, total: total });
         });
 
