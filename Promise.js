@@ -1,5 +1,34 @@
-var has = require('./has');
 var nextTick = require('./nextTick');
+
+function isPromise(value) {
+    return value && typeof value.then === 'function';
+}
+
+function runCallbacks(callbacks) {
+    var args = [];
+    for (var _i = 0; _i < (arguments.length - 1); _i++) {
+        args[_i] = arguments[_i + 1];
+    }
+    for (var i = 0, callback; callback = callbacks[i]; ++i) {
+        callback.apply(null, args);
+    }
+}
+
+/**
+* The Deferred class unwraps a promise in order to expose its internal state management functions.
+*/
+var Deferred = (function () {
+    function Deferred(canceler) {
+        var _this = this;
+        this.promise = new Promise(function (resolve, reject, progress, setCanceler) {
+            _this.progress = progress;
+            _this.reject = reject;
+            _this.resolve = resolve;
+            canceler && setCanceler(canceler);
+        });
+    }
+    return Deferred;
+})();
 
 /**
 * A Promise represents the result of an asynchronous operation. When writing a function that performs an asynchronous
@@ -14,16 +43,14 @@ var nextTick = require('./nextTick');
 *    rest of the application.
 *
 * The Promise class is a modified, extended version of standard EcmaScript 6 promises. This implementation
-* intentionally from the 2014-05-22 draft in the following ways:
+* intentionally deviates from the ES6 2014-05-22 draft in the following ways:
 *
-* 1. The internal mechanics use the term “fulfilled” to mean that the asynchronous operation is no longer in progress.
-*    The term “resolved” means that the operation completed successfully.
-* 2. `Promise.race` is a worthless API with one use case, so is not implemented.
-* 3. `Promise.all` accepts an object in addition to an array.
-* 4. Asynchronous operations can transmit partial progress information through a third `progress` method passed to the
+* 1. `Promise.race` is a worthless API with one use case, so is not implemented.
+* 2. `Promise.all` accepts an object in addition to an array.
+* 3. Asynchronous operations can transmit partial progress information through a third `progress` method passed to the
 *    initializer. Progress listeners can be added by passing a third `onProgress` callback to `then`, or through the
 *    extra `progress` method exposed on promises.
-* 5. Promises can be canceled
+* 4. Promises can be canceled by calling the `cancel` method of a promise.
 */
 var Promise = (function () {
     /**
@@ -49,29 +76,51 @@ var Promise = (function () {
         * The current state of this promise.
         */
         var state = 0 /* PENDING */;
+        Object.defineProperty(this, 'state', {
+            get: function () {
+                return state;
+            }
+        });
 
         /**
-        * The fulfilled value for this promise.
+        * Whether or not this promise is in a resolved state.
+        */
+        function isResolved() {
+            return state !== 0 /* PENDING */ || isChained;
+        }
+
+        /**
+        * If true, the resolution of this promise is chained to another promise.
+        */
+        var isChained = false;
+
+        /**
+        * The resolved value for this promise.
         *
         * @type {T|Error}
         */
-        var fulfilledValue;
+        var resolvedValue;
 
         /**
-        * A list of registered callbacks that should be executed once this promise has been resolved.
+        * Callbacks that should be invoked once the asynchronous operation has completed.
         */
-        var resolveCallbacks = [];
+        var callbacks = [];
+        var whenFinished = function (callback) {
+            callbacks.push(callback);
+        };
 
         /**
-        * A list of registered callbacks that should be executed once this promise has been rejected.
-        */
-        var rejectCallbacks = [];
-
-        /**
-        * A list of registered callbacks that should be executed when the underlying asynchronous operation has
-        * experienced progress.
+        * Callbacks that should be invoked when the asynchronous operation has progressed.
         */
         var progressCallbacks = [];
+        var whenProgress = function (callback) {
+            progressCallbacks.push(callback);
+        };
+
+        /**
+        * A canceler function that will be used to cancel resolution of this promise.
+        */
+        var canceler;
 
         /**
         * Queues a callback for execution during the next round through the event loop, in a way such that if a
@@ -109,208 +158,122 @@ var Promise = (function () {
             var schedule = originalSchedule;
 
             return function (callback) {
-                nextTick(callback);
-                return;
                 queue.push(callback);
                 schedule();
             };
         })();
 
         /**
-        * Immediately resolves a deferred using the value from a callback.
+        * Resolves this promise.
         *
-        * @param deferred
-        * The deferred that should be resolved using the value from `callback` as its resolved value.
-        *
-        * @param callback
-        * The callback that should be executed to get the new value. If the new value is a promise, resolution of the
-        * deferred is deferred until the promise is fulfilled.
-        *
-        * @param fulfilledValue
-        * The value to pass to the callback.
+        * @param newState The resolved state for this promise.
+        * @param {T|Error} value The resolved value for this promise.
         */
-        function execute(deferred, callback, fulfilledValue) {
-            if (callback) {
-                try  {
-                    var returnValue = callback(fulfilledValue);
-                    if (returnValue && returnValue.then) {
-                        returnValue.then(deferred.resolve, deferred.reject, deferred.progress);
-                        deferred.promise.cancel = returnValue.cancel;
-                    } else {
-                        deferred.resolve(returnValue);
-                    }
-                } catch (error) {
-                    deferred.reject(error);
+        var resolve = function (newState, value) {
+            if (isResolved()) {
+                return;
+            }
+
+            if (isPromise(value)) {
+                if (value === this) {
+                    throw new TypeError('Cannot chain a promise to itself');
                 }
-            } else if (state === 2 /* REJECTED */) {
-                deferred.reject(fulfilledValue);
+
+                isChained = true;
+                value.then(settle.bind(null, 1 /* FULFILLED */), settle.bind(null, 2 /* REJECTED */));
+
+                this.cancel = value.cancel;
             } else {
-                deferred.resolve(fulfilledValue);
+                settle(newState, value);
             }
-
-            var recanceler;
-            while ((recanceler = recancelers.shift())) {
-                recanceler.source.cancel(recanceler.reason);
-            }
-        }
+        }.bind(this);
 
         /**
-        * Immediately resolves a deferred using the value from a callback.
+        * Settles this promise.
         *
-        * @param deferred
-        * The deferred that should be resolved using the value from `callback` as its resolved value.
-        *
-        * @param callback
-        * The callback that should be executed to get the new value. If the new value is a promise, resolution of the
-        * deferred is deferred until the promise is fulfilled.
-        *
-        * @param fulfilledValue
-        * The value to pass to the callback.
+        * @param newState The resolved state for this promise.
+        * @param {T|Error} value The resolved value for this promise.
         */
-        function scheduleExecute(deferred, callback, fulfilledValue) {
-            var args = arguments;
-            enqueue(function () {
-                execute.apply(null, args);
-            });
-        }
-
-        /**
-        * Fulfills this promise.
-        *
-        * @param newState The fulfilled state for this promise.
-        * @param callbacks The callbacks that should be executed for the new state.
-        * @param {T|Error} value The fulfilled value for this promise.
-        */
-        function fulfill(newState, callbacks, value) {
-            if (state !== 0 /* PENDING */) {
-                if (has('debug')) {
-                    throw new Error('Attempted to fulfill an already fulfilled promise');
-                }
-
-                return;
-            }
-
+        function settle(newState, value) {
             state = newState;
-            fulfilledValue = value;
-            resolveCallbacks = rejectCallbacks = progressCallbacks = null;
-
-            for (var i = 0, callback; (callback = callbacks[i]); ++i) {
-                callback.deferred.promise.cancel = callback.originalCancel;
-                scheduleExecute(callback.deferred, callback.callback, fulfilledValue);
-            }
-        }
-
-        /**
-        * The canceler for this promise. The default canceler simply causes the promise to reject with the
-        * cancelation reason; promises representing asynchronous operations that can be cancelled should provide their
-        * own cancellers.
-        */
-        var canceler;
-
-        /**
-        * Sends progress data from the asynchronous operation to any progress listeners.
-        *
-        * @param data Additional information about the asynchronous operation’s progress.
-        */
-        function sendProgress(data) {
-            if (state !== 0 /* PENDING */) {
-                if (has('debug')) {
-                    throw new Error('Attempted to send progress data for an already fulfilled promise');
-                }
-
-                return;
-            }
-
-            progressCallbacks.forEach(function (callback) {
-                enqueue(function () {
-                    callback.callback && callback.callback(data);
-                    callback.deferred.progress(data);
-                });
+            resolvedValue = value;
+            whenFinished = enqueue;
+            whenProgress = function () {
+            };
+            enqueue(function () {
+                runCallbacks(callbacks);
+                callbacks = progressCallbacks = null;
             });
         }
 
-        Object.defineProperty(this, 'state', {
-            get: function () {
-                return state;
-            }
-        });
-
-        var recancelers = [];
-        var self = this;
-        this.cancel = function (reason, source) {
-            if (state !== 0 /* PENDING */ || (!canceler && source !== self)) {
-                // A consumer attempted to cancel the promise but it has already been fulfilled, so just ignore any
-                // attempts to cancel it
-                if (source === self) {
-                    // This is not an important error that should cause things to fail, but end-users should be informed
-                    // in case their code is misbehaving
-                    if (has('debug')) {
-                        console.debug('Attempted to cancel an already fulfilled promise');
-                    }
-                } else {
-                    recancelers.push({ source: source, reason: reason });
-                }
-
+        this.cancel = function (reason) {
+            if (isResolved() || !canceler) {
                 return;
             }
 
             if (!reason) {
-                reason = new Error('Canceled');
+                reason = new Error();
                 reason.name = 'CancelError';
             }
 
-            if (!canceler) {
-                throw new Error('Attempted to cancel an uncancelable promise');
-            }
-
             try  {
-                fulfill(1 /* RESOLVED */, resolveCallbacks, canceler(reason));
+                resolve(1 /* FULFILLED */, canceler(reason));
             } catch (error) {
-                fulfill(2 /* REJECTED */, rejectCallbacks, error);
+                settle(2 /* REJECTED */, error);
             }
         };
 
-        this.then = function (onResolved, onRejected, onProgress) {
-            var deferred = new Promise.Deferred();
-            var originalCancel = deferred.promise.cancel;
-            deferred.promise.cancel = function (reason, source) {
-                self.cancel(reason, source || this);
-            };
+        this.then = function (onFulfilled, onRejected, onProgress) {
+            return new Promise(function (resolve, reject, progress, setCanceler) {
+                setCanceler(function (reason) {
+                    if (canceler) {
+                        resolve(canceler(reason));
+                        return;
+                    }
 
-            if (state === 0 /* PENDING */) {
-                resolveCallbacks.push({
-                    deferred: deferred,
-                    callback: onResolved,
-                    originalCancel: originalCancel
+                    throw reason;
                 });
 
-                rejectCallbacks.push({
-                    deferred: deferred,
-                    callback: onRejected,
-                    originalCancel: originalCancel
+                whenProgress(function (data) {
+                    try  {
+                        if (typeof onProgress === 'function') {
+                            progress(onProgress(data));
+                        } else {
+                            progress(data);
+                        }
+                    } catch (error) {
+                        if (error.name !== 'StopProgressPropagation') {
+                            throw error;
+                        }
+                    }
                 });
 
-                progressCallbacks.push({
-                    deferred: deferred,
-                    callback: onProgress
-                });
-            } else if (state === 1 /* RESOLVED */) {
-                scheduleExecute(deferred, onResolved, fulfilledValue);
-            } else if (state === 2 /* REJECTED */) {
-                scheduleExecute(deferred, onRejected, fulfilledValue);
-            } else {
-                throw new Error('Unknown state ' + Promise.State[state]);
-            }
+                whenFinished(function () {
+                    var callback = state === 2 /* REJECTED */ ? onRejected : onFulfilled;
 
-            return deferred.promise;
+                    if (typeof callback === 'function') {
+                        try  {
+                            resolve(callback(resolvedValue));
+                        } catch (error) {
+                            reject(error);
+                        }
+                    } else if (state === 2 /* REJECTED */) {
+                        reject(resolvedValue);
+                    } else {
+                        resolve(resolvedValue);
+                    }
+                });
+            });
         };
 
         try  {
-            initializer(fulfill.bind(null, 1 /* RESOLVED */, resolveCallbacks), fulfill.bind(null, 2 /* REJECTED */, rejectCallbacks), sendProgress, function (value) {
+            initializer(resolve.bind(null, 1 /* FULFILLED */), resolve.bind(null, 2 /* REJECTED */), function (data) {
+                enqueue(runCallbacks.bind(null, progressCallbacks, data));
+            }, function (value) {
                 canceler = value;
             });
         } catch (error) {
-            fulfill(2 /* REJECTED */, rejectCallbacks, error);
+            settle(2 /* REJECTED */, error);
         }
     }
     Promise.all = function (iterable) {
@@ -343,7 +306,7 @@ var Promise = (function () {
 
             function processItem(key, value) {
                 ++total;
-                if (value && value.then) {
+                if (isPromise(value)) {
                     value.then(fulfill.bind(null, key), fulfill.bind(null, key));
                 } else {
                     fulfill(key, value);
@@ -398,8 +361,8 @@ var Promise = (function () {
         return this.then(null, onRejected);
     };
 
-    Promise.prototype.finally = function (onResolvedOrRejected) {
-        return this.then(onResolvedOrRejected, onResolvedOrRejected);
+    Promise.prototype.finally = function (onFulfilledOrRejected) {
+        return this.then(onFulfilledOrRejected, onFulfilledOrRejected);
     };
 
     /**
@@ -408,34 +371,21 @@ var Promise = (function () {
     Promise.prototype.progress = function (onProgress) {
         return this.then(null, null, onProgress);
     };
+
+    Promise.Deferred = Deferred;
     return Promise;
 })();
 
 var Promise;
 (function (Promise) {
-    /**
-    * The Deferred class unwraps a promise in order to expose its internal state management functions.
-    */
-    var Deferred = (function () {
-        function Deferred(canceler) {
-            var _this = this;
-            this.promise = new Promise(function (resolve, reject, progress, setCanceler) {
-                _this.progress = progress;
-                _this.reject = reject;
-                _this.resolve = resolve;
-                canceler && setCanceler(canceler);
-            });
-        }
-        return Deferred;
-    })();
-    Promise.Deferred = Deferred;
+    
 
     /**
     * The State enum represents the possible states of a promise.
     */
     (function (State) {
         State[State["PENDING"] = 0] = "PENDING";
-        State[State["RESOLVED"] = 1] = "RESOLVED";
+        State[State["FULFILLED"] = 1] = "FULFILLED";
         State[State["REJECTED"] = 2] = "REJECTED";
     })(Promise.State || (Promise.State = {}));
     var State = Promise.State;

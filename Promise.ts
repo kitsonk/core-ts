@@ -1,15 +1,61 @@
-import has = require('./has');
 import nextTick = require('./nextTick');
 
-interface ICallback<T, U> {
-	callback:(value?:T) => U;
-	deferred:Promise.Deferred<U>;
-	originalCancel?:(reason?:any) => void;
+function isPromise(value:any):boolean {
+	return value && typeof value.then === 'function';
 }
 
-interface IRecanceler {
-	source:Promise<any>;
-	reason:Error;
+function runCallbacks(callbacks:Array<(...args:any[]) => void>, ...args:any[]):void {
+	for (var i = 0, callback:(...args:any[]) => void; callback = callbacks[i]; ++i) {
+		callback.apply(null, args);
+	}
+}
+
+/**
+ * The Deferred class unwraps a promise in order to expose its internal state management functions.
+ */
+class Deferred<T> {
+	/**
+	 * The underlying promise for the Deferred.
+	 */
+	promise:Promise<T>;
+
+	constructor(canceler?:Promise.ICanceler) {
+		this.promise = new Promise<T>((
+			resolve:(value?:T) => void,
+			reject:(error?:Error) => void,
+			progress:(data?:any) => void,
+			setCanceler:(canceler:Promise.ICanceler) => void
+		):void => {
+			this.progress = progress;
+			this.reject = reject;
+			this.resolve = resolve;
+			canceler && setCanceler(canceler);
+		});
+	}
+
+	/**
+	 * Sends progress information for the underlying promise.
+	 *
+	 * @method
+	 * @param data Additional information about the asynchronous operation’s progress.
+	 */
+	progress:(data?:any) => void;
+
+	/**
+	 * Rejects the underlying promise with an error.
+	 *
+	 * @method
+	 * @param error The error that should be used as the fulfilled value for the promise.
+	 */
+	reject:(error?:Error) => void;
+
+	/**
+	 * Resolves the underlying promise with a value.
+	 *
+	 * @method
+	 * @param value The value that should be used as the fulfilled value for the promise.
+	 */
+	resolve:(value?:T) => void;
 }
 
 /**
@@ -25,16 +71,14 @@ interface IRecanceler {
  *    rest of the application.
  *
  * The Promise class is a modified, extended version of standard EcmaScript 6 promises. This implementation
- * intentionally from the 2014-05-22 draft in the following ways:
+ * intentionally deviates from the ES6 2014-05-22 draft in the following ways:
  *
- * 1. The internal mechanics use the term “fulfilled” to mean that the asynchronous operation is no longer in progress.
- *    The term “resolved” means that the operation completed successfully.
- * 2. `Promise.race` is a worthless API with one use case, so is not implemented.
- * 3. `Promise.all` accepts an object in addition to an array.
- * 4. Asynchronous operations can transmit partial progress information through a third `progress` method passed to the
+ * 1. `Promise.race` is a worthless API with one use case, so is not implemented.
+ * 2. `Promise.all` accepts an object in addition to an array.
+ * 3. Asynchronous operations can transmit partial progress information through a third `progress` method passed to the
  *    initializer. Progress listeners can be added by passing a third `onProgress` callback to `then`, or through the
  *    extra `progress` method exposed on promises.
- * 5. Promises can be canceled
+ * 4. Promises can be canceled by calling the `cancel` method of a promise.
  */
 class Promise<T> {
 	/**
@@ -43,12 +87,18 @@ class Promise<T> {
 	 * passed through as-is.
 	 *
 	 * @example
+	 * Promise.all([ Promise.resolve('foo'), 'bar' ]).then(function (value) {
+	 *   value[0] === 'foo'; // true
+	 *   value[1] === 'bar'; // true
+	 * });
+	 *
+	 * @example
 	 * Promise.all({
 	 *   foo: Promise.resolve('foo'),
 	 *   bar: 'bar'
-	 * }).then(function (resolved) {
-	 *   resolve.foo === 'foo'; // true
-	 *   resolve.bar === 'bar'; // true
+	 * }).then(function (value) {
+	 *   value.foo === 'foo'; // true
+	 *   value.bar === 'bar'; // true
 	 * });
 	 */
 	static all<T>(iterable:{ [key:string]:Promise<T>; }):Promise<{ [key:string]:T; }>;
@@ -88,7 +138,7 @@ class Promise<T> {
 
 			function processItem(key:string, value:any):void {
 				++total;
-				if (value && value.then) {
+				if (isPromise(value)) {
 					value.then(fulfill.bind(null, key), fulfill.bind(null, key));
 				}
 				else {
@@ -177,29 +227,51 @@ class Promise<T> {
 		 * The current state of this promise.
 		 */
 		var state:Promise.State = Promise.State.PENDING;
+		Object.defineProperty(this, 'state', {
+			get: function ():Promise.State {
+				return state;
+			}
+		});
 
 		/**
-		 * The fulfilled value for this promise.
+		 * Whether or not this promise is in a resolved state.
+		 */
+		function isResolved():boolean {
+			return state !== Promise.State.PENDING || isChained;
+		}
+
+		/**
+		 * If true, the resolution of this promise is chained to another promise.
+		 */
+		var isChained:boolean = false;
+
+		/**
+		 * The resolved value for this promise.
 		 *
 		 * @type {T|Error}
 		 */
-		var fulfilledValue:any;
+		var resolvedValue:any;
 
 		/**
-		 * A list of registered callbacks that should be executed once this promise has been resolved.
+		 * Callbacks that should be invoked once the asynchronous operation has completed.
 		 */
-		var resolveCallbacks:ICallback<T, any>[] = [];
+		var callbacks:Array<() => void> = [];
+		var whenFinished = function (callback:() => void):void {
+			callbacks.push(callback);
+		};
 
 		/**
-		 * A list of registered callbacks that should be executed once this promise has been rejected.
+		 * Callbacks that should be invoked when the asynchronous operation has progressed.
 		 */
-		var rejectCallbacks:ICallback<Error, any>[] = [];
+		var progressCallbacks:Array<(data?:any) => void> = [];
+		var whenProgress = function (callback:(data?:any) => void):void {
+			progressCallbacks.push(callback);
+		};
 
 		/**
-		 * A list of registered callbacks that should be executed when the underlying asynchronous operation has
-		 * experienced progress.
+		 * A canceler function that will be used to cancel resolution of this promise.
 		 */
-		var progressCallbacks:ICallback<any, any>[] = [];
+		var canceler:Promise.ICanceler;
 
 		/**
 		 * Queues a callback for execution during the next round through the event loop, in a way such that if a
@@ -238,229 +310,146 @@ class Promise<T> {
 			var schedule = originalSchedule;
 
 			return function (callback:(...args:any[]) => void):void {
-				nextTick(callback); return;
 				queue.push(callback);
 				schedule();
 			};
 		})();
 
 		/**
-		 * Immediately resolves a deferred using the value from a callback.
+		 * Resolves this promise.
 		 *
-		 * @param deferred
-		 * The deferred that should be resolved using the value from `callback` as its resolved value.
-		 *
-		 * @param callback
-		 * The callback that should be executed to get the new value. If the new value is a promise, resolution of the
-		 * deferred is deferred until the promise is fulfilled.
-		 *
-		 * @param fulfilledValue
-		 * The value to pass to the callback.
+		 * @param newState The resolved state for this promise.
+		 * @param {T|Error} value The resolved value for this promise.
 		 */
-		function execute(deferred:Promise.Deferred<any>, callback:(value?:any) => any, fulfilledValue:any):void {
-			if (callback) {
-				try {
-					var returnValue:any = callback(fulfilledValue);
-					if (returnValue && returnValue.then) {
-						returnValue.then(deferred.resolve, deferred.reject, deferred.progress);
-						deferred.promise.cancel = returnValue.cancel;
-					}
-					else {
-						deferred.resolve(returnValue);
-					}
-				}
-				catch (error) {
-					deferred.reject(error);
-				}
+		var resolve = function (newState:Promise.State, value:any):void {
+			if (isResolved()) {
+				return;
 			}
-			else if (state === Promise.State.REJECTED) {
-				deferred.reject(fulfilledValue);
+
+			if (isPromise(value)) {
+				if (value === this) {
+					throw new TypeError('Cannot chain a promise to itself');
+				}
+
+				isChained = true;
+				value.then(
+					settle.bind(null, Promise.State.FULFILLED),
+					settle.bind(null, Promise.State.REJECTED)
+				);
+
+				this.cancel = value.cancel;
 			}
 			else {
-				deferred.resolve(fulfilledValue);
+				settle(newState, value);
 			}
-
-			var recanceler:IRecanceler;
-			while ((recanceler = recancelers.shift())) {
-				recanceler.source.cancel(recanceler.reason);
-			}
-		}
+		}.bind(this);
 
 		/**
-		 * Immediately resolves a deferred using the value from a callback.
+		 * Settles this promise.
 		 *
-		 * @param deferred
-		 * The deferred that should be resolved using the value from `callback` as its resolved value.
-		 *
-		 * @param callback
-		 * The callback that should be executed to get the new value. If the new value is a promise, resolution of the
-		 * deferred is deferred until the promise is fulfilled.
-		 *
-		 * @param fulfilledValue
-		 * The value to pass to the callback.
+		 * @param newState The resolved state for this promise.
+		 * @param {T|Error} value The resolved value for this promise.
 		 */
-		function scheduleExecute(deferred:Promise.Deferred<any>, callback:(value?:any) => any, fulfilledValue:any):void {
-			var args:IArguments = arguments;
-			enqueue(function ():void {
-				execute.apply(null, args);
-			});
-		}
-
-		/**
-		 * Fulfills this promise.
-		 *
-		 * @param newState The fulfilled state for this promise.
-		 * @param callbacks The callbacks that should be executed for the new state.
-		 * @param {T|Error} value The fulfilled value for this promise.
-		 */
-		function fulfill(newState:Promise.State, callbacks:ICallback<any, any>[], value:any):void {
-			if (state !== Promise.State.PENDING) {
-				if (has('debug')) {
-					throw new Error('Attempted to fulfill an already fulfilled promise');
-				}
-
-				return;
-			}
-
+		function settle(newState:Promise.State, value:any):void {
 			state = newState;
-			fulfilledValue = value;
-			resolveCallbacks = rejectCallbacks = progressCallbacks = null;
-
-			for (var i = 0, callback:ICallback<any, any>; (callback = callbacks[i]); ++i) {
-				callback.deferred.promise.cancel = callback.originalCancel;
-				scheduleExecute(callback.deferred, callback.callback, fulfilledValue);
-			}
-		}
-
-		/**
-		 * The canceler for this promise. The default canceler simply causes the promise to reject with the
-		 * cancelation reason; promises representing asynchronous operations that can be cancelled should provide their
-		 * own cancellers.
-		 */
-		var canceler:Promise.ICanceler;
-
-		/**
-		 * Sends progress data from the asynchronous operation to any progress listeners.
-		 *
-		 * @param data Additional information about the asynchronous operation’s progress.
-		 */
-		function sendProgress(data?:any):void {
-			if (state !== Promise.State.PENDING) {
-				if (has('debug')) {
-					throw new Error('Attempted to send progress data for an already fulfilled promise');
-				}
-
-				return;
-			}
-
-			progressCallbacks.forEach(function (callback:ICallback<any, void>):void {
-				enqueue(function ():void {
-					callback.callback && callback.callback(data);
-					callback.deferred.progress(data);
-				});
+			resolvedValue = value;
+			whenFinished = enqueue;
+			whenProgress = function ():void {};
+			enqueue(function ():void {
+				runCallbacks(callbacks);
+				callbacks = progressCallbacks = null;
 			});
 		}
 
-		Object.defineProperty(this, 'state', {
-			get: function ():Promise.State {
-				return state;
-			}
-		});
-
-		var recancelers:IRecanceler[] = [];
-		var self = this;
-		this.cancel = function (reason?:Error, source?:Promise<any>):void {
-			if (state !== Promise.State.PENDING || (!canceler && source !== self)) {
-				// A consumer attempted to cancel the promise but it has already been fulfilled, so just ignore any
-				// attempts to cancel it
-				if (source === self) {
-					// This is not an important error that should cause things to fail, but end-users should be informed
-					// in case their code is misbehaving
-					if (has('debug')) {
-						console.debug('Attempted to cancel an already fulfilled promise');
-					}
-				}
-				// A consumer attempted to cancel a child promise but while we have been fulfilled, the child callback
-				// or one of its other parent callbacks has not been executed yet, so the cancellation came here. Wait
-				// until we execute callbacks and modify the cancel function then reperform the cancellation
-				else {
-					recancelers.push({ source: source, reason: reason });
-				}
-
+		this.cancel = function (reason?:Error):void {
+			if (isResolved() || !canceler) {
 				return;
 			}
 
 			if (!reason) {
-				reason = new Error('Canceled');
+				reason = new Error();
 				reason.name = 'CancelError';
 			}
 
-			if (!canceler) {
-				throw new Error('Attempted to cancel an uncancelable promise');
-			}
-
 			try {
-				fulfill(Promise.State.RESOLVED, resolveCallbacks, canceler(reason));
+				resolve(Promise.State.FULFILLED, canceler(reason));
 			}
 			catch (error) {
-				fulfill(Promise.State.REJECTED, rejectCallbacks, error);
+				settle(Promise.State.REJECTED, error);
 			}
 		};
 
 		this.then = function <U>(
-			onResolved?:(value?:T) => any,
-			onRejected?:(error?:Error) => any,
-			onProgress?:(data?:any) => void
+			onFulfilled?:(value?:T) => U,
+			onRejected?:(error?:Error) => U,
+			onProgress?:(data?:any) => any
 		):Promise<U> {
-			var deferred:Promise.Deferred<U> = new Promise.Deferred();
-			var originalCancel = deferred.promise.cancel;
-			deferred.promise.cancel = function (reason?:Error, source?:Promise<any>):void {
-				self.cancel(reason, source || this);
-			};
+			return new Promise<U>(function (
+				resolve:(value?:U) => void,
+				reject:(error?:Error) => void,
+				progress:(data?:any) => void,
+				setCanceler:(canceler:Promise.ICanceler) => void
+			):void {
+				setCanceler(function (reason:Error):void {
+					if (canceler) {
+						resolve(canceler(reason));
+						return;
+					}
 
-			if (state === Promise.State.PENDING) {
-				resolveCallbacks.push({
-					deferred: deferred,
-					callback: onResolved,
-					originalCancel: originalCancel
+					throw reason;
 				});
 
-				rejectCallbacks.push({
-					deferred: deferred,
-					callback: onRejected,
-					originalCancel: originalCancel
+				whenProgress(function (data?:any):void {
+					try {
+						if (typeof onProgress === 'function') {
+							progress(onProgress(data));
+						}
+						else {
+							progress(data);
+						}
+					}
+					catch (error) {
+						if (error.name !== 'StopProgressPropagation') {
+							throw error;
+						}
+					}
 				});
 
-				progressCallbacks.push({
-					deferred: deferred,
-					callback: onProgress
-				});
-			}
-			else if (state === Promise.State.RESOLVED) {
-				scheduleExecute(deferred, onResolved, fulfilledValue);
-			}
-			else if (state === Promise.State.REJECTED) {
-				scheduleExecute(deferred, onRejected, fulfilledValue);
-			}
-			else {
-				throw new Error('Unknown state ' + Promise.State[state]);
-			}
+				whenFinished(function ():void {
+					var callback:(value?:any) => any = state === Promise.State.REJECTED ? onRejected : onFulfilled;
 
-			return deferred.promise;
+					if (typeof callback === 'function') {
+						try {
+							resolve(callback(resolvedValue));
+						}
+						catch (error) {
+							reject(error);
+						}
+					}
+					else if (state === Promise.State.REJECTED) {
+						reject(resolvedValue);
+					}
+					else {
+						resolve(resolvedValue);
+					}
+				});
+			});
 		};
 
 		try {
 			initializer(
-				fulfill.bind(null, Promise.State.RESOLVED, resolveCallbacks),
-				fulfill.bind(null, Promise.State.REJECTED, rejectCallbacks),
-				sendProgress,
+				resolve.bind(null, Promise.State.FULFILLED),
+				resolve.bind(null, Promise.State.REJECTED),
+				function (data?:any):void {
+					enqueue(runCallbacks.bind(null, progressCallbacks, data));
+				},
 				function (value:Promise.ICanceler):void {
 					canceler = value;
 				}
 			);
 		}
 		catch (error) {
-			fulfill(Promise.State.REJECTED, rejectCallbacks, error);
+			settle(Promise.State.REJECTED, error);
 		}
 	}
 
@@ -494,16 +483,16 @@ class Promise<T> {
 	 * Adds a callback to the promise to be invoked regardless of whether or not the asynchronous operation completed
 	 * successfully.
 	 */
-	finally<U>(onResolvedOrRejected:(value?:any) => U):Promise<U>;
-	finally<U>(onResolvedOrRejected:(value?:any) => Promise<U>):Promise<U>;
-	finally<U>(onResolvedOrRejected:(value?:any) => any):Promise<U> {
-		return this.then<U>(onResolvedOrRejected, onResolvedOrRejected);
+	finally<U>(onFulfilledOrRejected:(value?:any) => U):Promise<U>;
+	finally<U>(onFulfilledOrRejected:(value?:any) => Promise<U>):Promise<U>;
+	finally<U>(onFulfilledOrRejected:(value?:any) => any):Promise<U> {
+		return this.then<U>(onFulfilledOrRejected, onFulfilledOrRejected);
 	}
 
 	/**
 	 * Adds a callback to the promise to be invoked when progress occurs within the asynchronous operation.
 	 */
-	progress(onProgress:(data?:any) => void):Promise<T> {
+	progress(onProgress:(data?:any) => any):Promise<T> {
 		return this.then<T>(null, null, onProgress);
 	}
 
@@ -511,11 +500,14 @@ class Promise<T> {
 	 * Adds a callback to the promise to be invoked when the asynchronous operation completes successfully.
 	 */
 	then:{
-		<U>(onResolved?:(value?:T) => U,          onRejected?:(error?:Error) => U,          onProgress?:(data?:any) => void):Promise<U>;
-		<U>(onResolved?:(value?:T) => U,          onRejected?:(error?:Error) => Promise<U>, onProgress?:(data?:any) => void):Promise<U>;
-		<U>(onResolved?:(value?:T) => Promise<U>, onRejected?:(error?:Error) => U,          onProgress?:(data?:any) => void):Promise<U>;
-		<U>(onResolved?:(value?:T) => Promise<U>, onRejected?:(error?:Error) => Promise<U>, onProgress?:(data?:any) => void):Promise<U>;
+		<U>(onFulfilled?:(value?:T) => U,          onRejected?:(error?:Error) => U,          onProgress?:(data?:any) => any):Promise<U>;
+		<U>(onFulfilled?:(value?:T) => U,          onRejected?:(error?:Error) => Promise<U>, onProgress?:(data?:any) => any):Promise<U>;
+		<U>(onFulfilled?:(value?:T) => Promise<U>, onRejected?:(error?:Error) => U,          onProgress?:(data?:any) => any):Promise<U>;
+		<U>(onFulfilled?:(value?:T) => Promise<U>, onRejected?:(error?:Error) => Promise<U>, onProgress?:(data?:any) => any):Promise<U>;
 	};
+
+	// workaround for TS#2557
+	static Deferred:typeof Deferred = Deferred;
 }
 
 module Promise {
@@ -523,28 +515,12 @@ module Promise {
 		(reason:Error):any;
 	}
 
-	/**
-	 * The Deferred class unwraps a promise in order to expose its internal state management functions.
-	 */
-	export class Deferred<T> {
+	// workaround for TS#2557
+	export interface Deferred<T> {
 		/**
 		 * The underlying promise for the Deferred.
 		 */
 		promise:Promise<T>;
-
-		constructor(canceler?:Promise.ICanceler) {
-			this.promise = new Promise<T>((
-				resolve:(value?:any) => void,
-				reject:(error?:any) => void,
-				progress:(data?:any) => void,
-				setCanceler:(canceler:Promise.ICanceler) => void
-			):void => {
-				this.progress = progress;
-				this.reject = reject;
-				this.resolve = resolve;
-				canceler && setCanceler(canceler);
-			});
-		}
 
 		/**
 		 * Sends progress information for the underlying promise.
@@ -558,7 +534,7 @@ module Promise {
 		 * Rejects the underlying promise with an error.
 		 *
 		 * @method
-		 * @param error The error that should be used as the fulfilled value for the promise.
+		 * @param error The error that should be used as the resolved value for the promise.
 		 */
 		reject:(error?:Error) => void;
 
@@ -566,7 +542,7 @@ module Promise {
 		 * Resolves the underlying promise with a value.
 		 *
 		 * @method
-		 * @param value The value that should be used as the fulfilled value for the promise.
+		 * @param value The value that should be used as the resolved value for the promise.
 		 */
 		resolve:(value?:T) => void;
 	}
@@ -576,7 +552,7 @@ module Promise {
 	 */
 	export enum State {
 		PENDING,
-		RESOLVED,
+		FULFILLED,
 		REJECTED
 	}
 }

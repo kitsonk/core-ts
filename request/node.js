@@ -1,8 +1,18 @@
 var http = require('http');
 var https = require('https');
+var kernel = require('../kernel');
 var Promise = require('../Promise');
 
 var urlUtil = require('url');
+
+function normalizeHeaders(headers) {
+    var normalizedHeaders = {};
+    for (var key in headers) {
+        normalizedHeaders[key.toLowerCase()] = headers[key];
+    }
+
+    return normalizedHeaders;
+}
 
 function node(url, options) {
     var deferred = new Promise.Deferred(function (reason) {
@@ -10,14 +20,15 @@ function node(url, options) {
         throw reason;
     });
     var promise = deferred.promise;
-    var parsedUrl = urlUtil.parse(url);
+    var parsedUrl = urlUtil.parse(options.proxy || url);
+
     var requestOptions = {
         agent: options.agent,
         auth: parsedUrl.auth || options.auth,
         ca: options.ca,
         cert: options.cert,
         ciphers: options.ciphers,
-        headers: options.headers,
+        headers: normalizeHeaders(options.headers || {}),
         host: parsedUrl.host,
         hostname: parsedUrl.hostname,
         key: options.key,
@@ -31,6 +42,23 @@ function node(url, options) {
         secureProtocol: options.secureProtocol,
         socketPath: options.socketPath
     };
+
+    if (!('user-agent' in requestOptions.headers)) {
+        requestOptions.headers['user-agent'] = 'dojo/' + kernel.version + ' Node.js/' + process.version.replace(/^v/, '');
+    }
+
+    if (options.proxy) {
+        requestOptions.path = url;
+        if (parsedUrl.auth) {
+            requestOptions.headers['proxy-authorization'] = 'Basic ' + new Buffer(parsedUrl.auth).toString('base64');
+        }
+
+        (function () {
+            var parsedUrl = urlUtil.parse(url);
+            requestOptions.headers['host'] = parsedUrl.host;
+            requestOptions.auth = parsedUrl.auth || options.auth;
+        })();
+    }
 
     if (!options.auth && (options.user || options.password)) {
         requestOptions.auth = encodeURIComponent(options.user || '') + ':' + encodeURIComponent(options.password || '');
@@ -76,7 +104,7 @@ function node(url, options) {
 
         nativeResponse.on('data', function (chunk) {
             options.streamData || data.push(chunk);
-            loaded += Buffer.byteLength(chunk.toString(options.streamEncoding || 'utf8'));
+            loaded += typeof chunk === 'string' ? Buffer.byteLength(chunk, options.streamEncoding) : chunk.length;
             deferred.progress({ type: 'data', chunk: chunk, loaded: loaded, total: total });
         });
 

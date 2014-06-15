@@ -2,6 +2,7 @@
 import core = require('../interfaces');
 import http = require('http');
 import https = require('https');
+import kernel = require('../kernel');
 import Promise = require('../Promise');
 import request = require('../request');
 import urlUtil = require('url');
@@ -41,6 +42,7 @@ module node {
 		localAddress?:string;
 		passphrase?:string;
 		pfx?:any;
+		proxy?:string;
 		rejectUnauthorized?:boolean;
 		secureProtocol?:string;
 		socketPath?:string;
@@ -54,20 +56,30 @@ module node {
 	}
 }
 
+function normalizeHeaders(headers:{ [name:string]:string; }):{ [name:string]:string; } {
+	var normalizedHeaders:{ [name:string]:string; } = {};
+	for (var key in headers) {
+		normalizedHeaders[key.toLowerCase()] = headers[key];
+	}
+
+	return normalizedHeaders;
+}
+
 function node(url:string, options:node.INodeRequestOptions):Promise<request.IResponse> {
 	var deferred:Promise.Deferred<request.IResponse> = new Promise.Deferred(function (reason:Error):void {
 		request && request.abort();
 		throw reason;
 	});
 	var promise:request.IRequestPromise = <request.IRequestPromise> deferred.promise;
-	var parsedUrl:urlUtil.Url = urlUtil.parse(url);
+	var parsedUrl:urlUtil.Url = urlUtil.parse(options.proxy || url);
+
 	var requestOptions:IHttpsOptions = {
 		agent: options.agent,
 		auth: parsedUrl.auth || options.auth,
 		ca: options.ca,
 		cert: options.cert,
 		ciphers: options.ciphers,
-		headers: options.headers,
+		headers: normalizeHeaders(options.headers || {}),
 		host: parsedUrl.host,
 		hostname: parsedUrl.hostname,
 		key: options.key,
@@ -81,6 +93,23 @@ function node(url:string, options:node.INodeRequestOptions):Promise<request.IRes
 		secureProtocol: options.secureProtocol,
 		socketPath: options.socketPath
 	};
+
+	if (!('user-agent' in requestOptions.headers)) {
+		requestOptions.headers['user-agent'] = 'dojo/' + kernel.version + ' Node.js/' + process.version.replace(/^v/, '');
+	}
+
+	if (options.proxy) {
+		requestOptions.path = url;
+		if (parsedUrl.auth) {
+			requestOptions.headers['proxy-authorization'] = 'Basic ' + new Buffer(parsedUrl.auth).toString('base64');
+		}
+
+		(function ():void {
+			var parsedUrl:urlUtil.Url = urlUtil.parse(url);
+			requestOptions.headers['host'] = parsedUrl.host;
+			requestOptions.auth = parsedUrl.auth || options.auth;
+		})();
+	}
 
 	if (!options.auth && (options.user || options.password)) {
 		requestOptions.auth = encodeURIComponent(options.user || '') + ':' + encodeURIComponent(options.password || '');
@@ -126,7 +155,7 @@ function node(url:string, options:node.INodeRequestOptions):Promise<request.IRes
 
 		nativeResponse.on('data', function (chunk:any):void {
 			options.streamData || data.push(chunk);
-			loaded += Buffer.byteLength(chunk.toString(options.streamEncoding || 'utf8'));
+			loaded += typeof chunk === 'string' ? Buffer.byteLength(chunk, options.streamEncoding) : chunk.length;
 			deferred.progress({ type: 'data', chunk: chunk, loaded: loaded, total: total });
 		});
 
