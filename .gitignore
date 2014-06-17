@@ -1,5 +1,4 @@
 .sublimets
-*.js
 *.js.map
 node_modules
 !/node.js
