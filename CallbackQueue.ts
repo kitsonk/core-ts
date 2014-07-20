@@ -27,8 +27,7 @@ class CallbackQueue<T extends Function> {
 
 	drain(...args:any[]):void {
 		var callbacks = this._callbacks,
-			item:IQueueItem<T>,
-			callback:T;
+			item:IQueueItem<T>;
 
 		// Any callbacks added after drain is called will be processed
 		// the next time drain is called
